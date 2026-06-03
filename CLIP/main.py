@@ -10,7 +10,7 @@ import torch.utils.data
 import utils
 
 import clip
-from unlearn import MUNBa, FT, GA, SalUn, SHs, IMU
+from unlearn import MUNBa, FT, GA, SalUn, IMU
 
 
 def main():
