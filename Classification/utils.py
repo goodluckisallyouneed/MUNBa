@@ -282,6 +282,88 @@ def setup_model_dataset(args):
             val_loader = loaders["val"]
             return model, retain_loader, forget_loader, val_loader
 
+    elif args.dataset == "imagenet100":
+        # ImageNet-100: direct HuggingFace dataset ``clane9/imagenet-100``.
+        # Returns the same 6-tuple shape as the celeba branch:
+        #     (model, train_full, val, test, forget, retain)
+        # which main_forget.py / main_random.py treat as "loaders are
+        # already split, no marked_loader needed".
+        classes = 100
+        normalization = NormalizeByChannelMeanStd(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+
+        # Build the train / val loaders (with optional class-to-replace
+        # forget/retain split inside ``prepare_data``).
+        if args.class_to_replace is not None and args.class_to_replace >= 0:
+            # Convert the 0..99 contiguous label space to subset indices for
+            # ``prepare_data``: we mark a single class as the forget set.
+            # Because ``prepare_data`` for imagenet100 already remaps to
+            # contiguous labels via the closure, we just pre-build masks on
+            # the contiguous label space by streaming once.
+            tmp = prepare_data(
+                dataset="imagenet100",
+                batch_size=args.batch_size,
+                shuffle=False,
+                data_path=getattr(args, "data", "/localscratch/dataset"),
+            )
+            # Walk train/val labels once to build subset indicators.
+            train_ys = []
+            for batch in tmp["train"]:
+                y = batch["label"] if isinstance(batch, dict) else batch[1]
+                train_ys.append(torch.as_tensor(y).view(-1))
+            train_ys = torch.cat(train_ys)
+            val_ys = []
+            for batch in tmp["val"]:
+                y = batch["label"] if isinstance(batch, dict) else batch[1]
+                val_ys.append(torch.as_tensor(y).view(-1))
+            val_ys = torch.cat(val_ys)
+
+            train_subset_indices = torch.ones_like(train_ys)
+            val_subset_indices = torch.ones_like(val_ys)
+            train_subset_indices[train_ys == args.class_to_replace] = 0
+            val_subset_indices[val_ys == args.class_to_replace] = 0
+
+            loaders = prepare_data(
+                dataset="imagenet100",
+                batch_size=args.batch_size,
+                train_subset_indices=train_subset_indices,
+                val_subset_indices=val_subset_indices,
+                data_path=getattr(args, "data", "/localscratch/dataset"),
+            )
+            retain_loader = loaders["train"]
+            forget_loader = loaders["fog"]
+            val_loader = loaders["val"]
+            # ``test_loader`` is the same as ``val_loader`` for ImageNet (no
+            # held-out test split is publicly labelled). Reuse val for both.
+            test_loader = val_loader
+            train_full_loader = val_loader  # only used for size assertions
+        else:
+            loaders = prepare_data(
+                dataset="imagenet100",
+                batch_size=args.batch_size,
+                data_path=getattr(args, "data", "/localscratch/dataset"),
+            )
+            train_full_loader = loaders["train"]
+            val_loader = loaders["val"]
+            test_loader = val_loader
+            forget_loader = None
+            retain_loader = train_full_loader
+
+        if args.imagenet_arch:
+            model = model_dict[args.arch](num_classes=classes, imagenet=True)
+        else:
+            model = model_dict[args.arch](num_classes=classes, imagenet=True)
+        model.normalize = normalization
+        return (
+            model,
+            train_full_loader,
+            val_loader,
+            test_loader,
+            forget_loader,
+            retain_loader,
+        )
+
     elif args.dataset == "cifar100_no_val":
         classes = 100
         normalization = NormalizeByChannelMeanStd(
