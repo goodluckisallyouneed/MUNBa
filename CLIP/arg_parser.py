@@ -60,6 +60,23 @@ def parse_args():
                         help="IMU: clip per-sample weights at this quantile of sqrt(|inf|)")
     parser.add_argument("--imu_eps", type=float, default=0.01,
                         help="IMU: damping epsilon added to the diagonal Fisher")
+    parser.add_argument("--imu_cache_dir", type=str, default=None,
+                        help="IMU: directory to cache per-sample influences. "
+                             "Defaults to <save_dir>/imu_influence_cache when "
+                             "--save_dir is set, otherwise ./.cache/imu_influence_cache.")
+    parser.add_argument("--imu_recompute_influences", action="store_true",
+                        default=False,
+                        help="IMU: ignore cached influences and recompute them.")
+
+    ##################################### IU (Wfisher) setting #################
+    parser.add_argument("--iu_N", type=float, default=1000.0,
+                        help="IU/Wfisher: damping constant N in the rank-1 "
+                             "Woodfisher recursion (default 1000, matches the "
+                             "reference CIFAR setting).")
+    parser.add_argument("--iu_max_retain_samples", type=int, default=0,
+                        help="IU/Wfisher: cap on the number of retain samples "
+                             "used in the Woodfisher per-sample pass. 0 means "
+                             "use the default (min(1000, len(retain))).")
 
     ##################################### ImageNet-100 setting #########################################
     parser.add_argument("--forget_class_ratio", type=float, default=0.1,
