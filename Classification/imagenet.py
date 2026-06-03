@@ -52,6 +52,65 @@ def prepare_data(
             examples["image"] = [transform(x) for x in examples["image"]]
             return examples
 
+    elif dataset == "imagenet100":
+     
+        hf_name = "clane9/imagenet-100"
+
+        def _load_first_available_split(split_candidates):
+            last_error = None
+            for split in split_candidates:
+                try:
+                    return load_dataset(hf_name, split=split, cache_dir=path)
+                except Exception as exc:
+                    last_error = exc
+            raise last_error
+
+        train_set = _load_first_available_split(["train"])
+        validation_set = _load_first_available_split(
+            ["validation", "val", "valid", "test"]
+        )
+
+        def _keys(examples):
+            image_key = "image" if "image" in examples else "img"
+            label_key = "label" if "label" in examples else "labels"
+            return image_key, label_key
+
+        def train_transform(examples):
+            image_key, label_key = _keys(examples)
+            transform = torchvision.transforms.Compose(
+                [
+                    torchvision.transforms.Lambda(lambda x: x.convert("RGB")),
+                    torchvision.transforms.RandomResizedCrop((224, 224)),
+                    torchvision.transforms.RandomHorizontalFlip(),
+                    torchvision.transforms.ToTensor(),
+                ]
+            )
+            examples["image"] = [transform(x) for x in examples[image_key]]
+            examples["label"] = [int(y) for y in examples[label_key]]
+            if image_key != "image":
+                examples.pop(image_key, None)
+            if label_key != "label":
+                examples.pop(label_key, None)
+            return examples
+
+        def validation_transform(examples):
+            image_key, label_key = _keys(examples)
+            transform = torchvision.transforms.Compose(
+                [
+                    torchvision.transforms.Lambda(lambda x: x.convert("RGB")),
+                    torchvision.transforms.Resize((256, 256)),
+                    torchvision.transforms.CenterCrop((224, 224)),
+                    torchvision.transforms.ToTensor(),
+                ]
+            )
+            examples["image"] = [transform(x) for x in examples[image_key]]
+            examples["label"] = [int(y) for y in examples[label_key]]
+            if image_key != "image":
+                examples.pop(image_key, None)
+            if label_key != "label":
+                examples.pop(label_key, None)
+            return examples
+
     elif dataset == "tiny_imagenet":
         train_set = load_dataset(
             "Maysee/tiny-imagenet", use_auth_token=True, split="train", cache_dir=path
