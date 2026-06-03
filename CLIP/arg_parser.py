@@ -52,5 +52,20 @@ def parse_args():
     parser.add_argument("--beta", type=float, default=1.0)
 
     parser.add_argument("--skip", action="store_true", default=False)
+
+    ##################################### IMU setting #################################################
+    parser.add_argument("--top_data", type=float, default=1.0,
+                        help="IMU: top-fraction of negative-influence forget samples to keep")
+    parser.add_argument("--imu_clip_quantile", type=float, default=0.93,
+                        help="IMU: clip per-sample weights at this quantile of sqrt(|inf|)")
+    parser.add_argument("--imu_eps", type=float, default=0.01,
+                        help="IMU: damping epsilon added to the diagonal Fisher")
+
+    ##################################### ImageNet-100 setting #########################################
+    parser.add_argument("--forget_class_ratio", type=float, default=0.1,
+                        help="ImageNet-100: fraction of classes used as the forget set")
+    parser.add_argument("--forget_classes", type=str, default=None,
+                        help="ImageNet-100: comma-separated explicit class indices "
+                             "to forget (overrides --forget_class_ratio)")
     return parser.parse_args()
 
