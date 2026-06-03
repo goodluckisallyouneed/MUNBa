@@ -1,26 +1,7 @@
-"""IMU (Influence-guided Machine Unlearning) for CLIP.
-
-Adapted from the original implementation
-(``IMU/Classification/unlearn/IMU.py``). Differences vs. the ResNet version:
-
-* The "fc" layer no longer exists in CLIP. We use the joint-embedding
-  *projection* layer + the LayerNorm right before it as the head:
-    - ``mode == "text"``  : ``text_projection`` + ``ln_final.{weight,bias}``
-    - ``mode == "image"`` : ``visual.proj`` + ``visual.ln_post.{weight,bias}``
-    - ``mode == "all"``   : both
-  This head is used **both** for influence/Fisher computation and as the
-  trainable parameter set for the SGD unlearn step (so the influence signal
-  and the update direction live in the same subspace).
-
-* The forward pass mirrors ``unlearn/GA.py``: cosine similarity between
-  CLIP image features and text features over the class prompts, scaled by
-  ``logit_scale = 100``.
-
-* Per-sample influence scores are computed with a streaming two-pass loop
-  to avoid materializing the full [N, P] gradient matrix.
-"""
-
 import gc
+import hashlib
+import json
+import os
 import time
 
 import numpy as np
@@ -192,6 +173,161 @@ def compute_influences(model, forget_loader, texts, logit_scale,
 
 
 # ---------------------------------------------------------------------------
+# Influence cache (disk-based)
+# ---------------------------------------------------------------------------
+# `compute_fisher_diag` + `compute_influences` are deterministic functions of
+# (model weights, forget set, texts, logit_scale, mode, eps). They do NOT
+# depend on training-stage knobs such as `top_data`, `imu_clip_quantile`,
+# `unlearn_lr`, `unlearn_epochs`, `alpha`, ... So when the user only tweaks
+# those training knobs, we can reuse a cached `influences` (and Fisher) tensor
+# instead of recomputing the two-pass loop over the whole forget set.
+def _forget_dataset_fingerprint(forget_loader):
+    """A cheap-but-stable signature of the forget set.
+
+    We hash:
+      * len(dataset)
+      * the integer targets of every sample (a few KB at most for typical
+        forget sets), via dataset[i][1].
+    This is enough to detect changes in `forget_classes`, `forget_class_ratio`,
+    `seed`-driven splits, dataset path, etc., without re-running expensive
+    transforms.
+    """
+    dataset = forget_loader.dataset
+    targets = []
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        # support (img, target) and (img, target, ...) tuples
+        target = sample[1]
+        if torch.is_tensor(target):
+            target = int(target.reshape(-1)[0].item())
+        else:
+            target = int(target)
+        targets.append(target)
+    h = hashlib.sha1()
+    h.update(str(len(dataset)).encode("utf-8"))
+    h.update(b"|")
+    h.update(np.asarray(targets, dtype=np.int64).tobytes())
+    return h.hexdigest()[:16], len(dataset)
+
+
+def _model_weights_fingerprint(head_params):
+    """Light-weight fingerprint of the head weights at influence time.
+
+    The head is what we differentiate through, so if its weights change the
+    gradients change. We hash a few summary stats per parameter (shape + a
+    handful of moments) instead of the full tensor to keep this cheap.
+    """
+    h = hashlib.sha1()
+    with torch.no_grad():
+        for p in head_params:
+            t = p.detach().to(torch.float32).cpu()
+            h.update(str(tuple(t.shape)).encode("utf-8"))
+            stats = torch.tensor([
+                t.numel(),
+                t.sum().item(),
+                (t * t).sum().item(),
+                t.min().item(),
+                t.max().item(),
+            ], dtype=torch.float64).numpy().tobytes()
+            h.update(stats)
+    return h.hexdigest()[:16]
+
+
+def _influence_cache_key(args, head_params, forget_loader, mode, eps,
+                         logit_scale):
+    forget_sig, n_forget = _forget_dataset_fingerprint(forget_loader)
+    weight_sig = _model_weights_fingerprint(head_params)
+    payload = {
+        "dataset": getattr(args, "dataset", None),
+        "data": getattr(args, "data", None),
+        "data_dir": getattr(args, "data_dir", None),
+        "arch": getattr(args, "arch", None),
+        "num_classes": getattr(args, "num_classes", None),
+        "seed": getattr(args, "seed", None),
+        "forget_classes": getattr(args, "forget_classes", None),
+        "forget_class_ratio": getattr(args, "forget_class_ratio", None),
+        "mode": mode,
+        "imu_eps": float(eps),
+        "logit_scale": float(logit_scale),
+        "n_forget": int(n_forget),
+        "forget_sig": forget_sig,
+        "weight_sig": weight_sig,
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    digest = hashlib.sha1(blob).hexdigest()[:16]
+    return digest, payload
+
+
+def _resolve_cache_dir(args):
+    explicit = getattr(args, "imu_cache_dir", None)
+    if explicit:
+        return explicit
+    save_dir = getattr(args, "save_dir", None)
+    if save_dir:
+        return os.path.join(save_dir, "imu_influence_cache")
+    return os.path.join(".cache", "imu_influence_cache")
+
+
+def _load_or_compute_influences(model, forget_loader, texts, logit_scale,
+                                head_params, mode, device, eps, args):
+    """Return (inv_fisher_diag, influences), using disk cache when possible."""
+    recompute = bool(getattr(args, "imu_recompute_influences", False))
+    cache_dir = _resolve_cache_dir(args)
+    digest, payload = _influence_cache_key(
+        args, head_params, forget_loader, mode, eps, logit_scale,
+    )
+    cache_file = os.path.join(cache_dir, f"influences_{digest}.pt")
+    meta_file = os.path.join(cache_dir, f"influences_{digest}.json")
+
+    if not recompute and os.path.isfile(cache_file):
+        try:
+            blob = torch.load(cache_file, map_location="cpu")
+            influences = blob["influences"]
+            inv_fisher_diag = blob["inv_fisher_diag"].to(head_params[0].device)
+            cached_n = int(blob.get("n_forget", -1))
+            if cached_n == int(payload["n_forget"]) and len(influences) == cached_n:
+                print(f"[IMU] influence cache HIT  -> {cache_file}")
+                return inv_fisher_diag, influences
+            print(
+                f"[IMU] influence cache file present but size mismatch "
+                f"(cached n={cached_n}, current n={payload['n_forget']}); "
+                f"recomputing."
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[IMU] failed to load influence cache ({exc}); recomputing.")
+
+    print(f"[IMU] influence cache MISS -> {cache_file}")
+    print("[IMU] computing diagonal Fisher inverse ...")
+    inv_fisher_diag = compute_fisher_diag(
+        model, forget_loader, texts, logit_scale,
+        head_params, mode, device, eps,
+    )
+    print("[IMU] computing per-sample influences ...")
+    influences = compute_influences(
+        model, forget_loader, texts, logit_scale,
+        head_params, mode, device, inv_fisher_diag,
+    )
+
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        torch.save(
+            {
+                "influences": influences.detach().cpu(),
+                "inv_fisher_diag": inv_fisher_diag.detach().cpu(),
+                "n_forget": int(payload["n_forget"]),
+            },
+            cache_file,
+        )
+        with open(meta_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True, default=str)
+        print(f"[IMU] influence cache SAVED -> {cache_file}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[IMU] failed to save influence cache ({exc}); continuing.")
+
+    return inv_fisher_diag, influences
+
+
+# ---------------------------------------------------------------------------
 # Influence-weighted dataset
 # ---------------------------------------------------------------------------
 class InfluenceWeightedDataset(torch.utils.data.Dataset):
@@ -242,18 +378,14 @@ def IMU(texts, data_loaders, model, args, class_name):
     clip_q = float(getattr(args, "imu_clip_quantile", 0.93))
     top_data = float(getattr(args, "top_data", 1.0))
 
-    # ---- Stage 1: Fisher diag inverse over forget set (head-only) ------------
-    print("[IMU] computing diagonal Fisher inverse ...")
-    inv_fisher_diag = compute_fisher_diag(
+    # ---- Stage 1+2: Fisher diag inverse + per-sample influences -------------
+    # Both quantities only depend on (model weights, forget set, texts,
+    # logit_scale, mode, eps); they are independent of training-stage knobs
+    # like top_data / imu_clip_quantile / unlearn_lr / alpha / epochs / ...,
+    # so we cache them on disk and reuse across runs that only tweak those.
+    inv_fisher_diag, influences = _load_or_compute_influences(
         model, forget_loader, texts, logit_scale,
-        head_params, args.mode, device, eps,
-    )
-
-    # ---- Stage 2: per-sample influences (streaming two-pass) -----------------
-    print("[IMU] computing per-sample influences ...")
-    influences = compute_influences(
-        model, forget_loader, texts, logit_scale,
-        head_params, args.mode, device, inv_fisher_diag,
+        head_params, args.mode, device, eps, args,
     )
     print(
         f"[IMU] influences: n={len(influences)}, "
