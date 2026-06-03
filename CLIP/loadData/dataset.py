@@ -1,83 +1,97 @@
 """
-    function for loading datasets
-    contains:
-        Oxford_pets
+    setup model and datasets
 """
+
+
+import copy
+import os
+import random
+
+# from advertorch.utils import NormalizeByChannelMeanStd
+import shutil
+import sys
+import time
+
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset, random_split
-from torchvision.datasets import ImageFolder, OxfordIIITPet
-from torchvision import transforms, datasets
-from torch.utils.data import Dataset
-from typing import (
-    Sequence,
-    TypeVar,
-)
-import os
+from dataset import *
+from dataset import TinyImageNet
+from imagenet import prepare_data
+from models import *
+from models.resnet_im import resnet34
+from torchvision import transforms
 
-from .load_oxfordpets import OxfordPets
-
-
-T_co = TypeVar('T_co', covariant=True)
-class Custom_Subset(Dataset[T_co]):
-    r"""
-    Subset of a dataset at specified indices.
-
-    Args:
-        dataset (Dataset): The whole Dataset
-        indices (sequence): Indices in the whole set selected for subset
-    """
-    dataset: Dataset[T_co]
-    indices: Sequence[int]
-
-    def __init__(self, dataset: Dataset[T_co], indices: Sequence[int]) -> None:
-        self.dataset = dataset
-        self.indices = indices
-        self.targets = dataset.targets[indices]
-
-    def __getitem__(self, idx):
-        if isinstance(idx, list):
-            return self.dataset[[self.indices[i] for i in idx]]
-        return self.dataset[self.indices[idx]]
-
-    def __len__(self):
-        return len(self.indices)
+__all__ = [
+    "setup_model_dataset",
+    "AverageMeter",
+    "warmup_lr",
+    "save_checkpoint",
+    "setup_seed",
+    "accuracy",
+]
 
 
-class preprocessDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset, transform):
-        self.dataset = dataset
-        self.transform = transform
+def warmup_lr(epoch, step, optimizer, one_epoch_step, args):
+    overall_steps = args.warmup * one_epoch_step
+    current_steps = epoch * one_epoch_step + step
 
-    def __len__(self):
-        return len(self.dataset)
+    lr = args.lr * current_steps / overall_steps
+    lr = min(lr, args.lr)
 
-    def __getitem__(self, index):
-        image, target = self.dataset[index]
-        augmented_image = self.transform(image)
-        return augmented_image, target
+    for p in optimizer.param_groups:
+        p["lr"] = lr
 
 
-# Oxford_pets
-def oxfordPets_dataloaders(
-    batch_size=128,
-    data_dir="/data/datasets/oxford_pets",
-    num_workers=2,
-    seed: int = 1,
-    no_aug=False,
+def save_checkpoint(
+    state, is_SA_best, save_path, pruning, filename="checkpoint.pth.tar"
 ):
+    filepath = os.path.join(save_path, str(pruning) + filename)
+    torch.save(state, filepath)
+    if is_SA_best:
+        shutil.copyfile(
+            filepath, os.path.join(save_path, str(pruning) + "model_SA_best.pth.tar")
+        )
 
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    if no_aug:
+
+def load_checkpoint(device, save_path, pruning, filename="checkpoint.pth.tar"):
+    filepath = os.path.join(save_path, str(pruning) + filename)
+    if os.path.exists(filepath):
+        print("Load checkpoint from:{}".format(filepath))
+        return torch.load(filepath, device)
+    print("Checkpoint not found! path:{}".format(filepath))
+    return None
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def dataset_convert_to_train(dataset, args=None):
+    if (args.dataset == "cifar10") or (args.dataset == "svhn") or (args.dataset == "cifar100"):
         train_transform = transforms.Compose(
             [
-                transforms.Resize((256, 256)),
-                transforms.CenterCrop(224),
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                normalize,
             ]
         )
     else:
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         train_transform = transforms.Compose(
             [
                 transforms.Resize((256, 256)),
@@ -87,303 +101,18 @@ def oxfordPets_dataloaders(
                 normalize,
             ]
         )
-
-    test_transform = transforms.Compose(
-        [
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
-    print(
-        "Dataset information: Oxford Pets"
-    )
-
-    train_set = OxfordPets(data_dir, train=True, transform=train_transform)
-    test_set = OxfordPets(data_dir, train=False, transform=test_transform)
-
-    # raw_train_set = OxfordIIITPet(root='./data/oxford-pets', download=True)
-    # raw_test_set = OxfordIIITPet(root='./data/oxford-pets', split='test', download=True)
-    # train_set = preprocessDataset(raw_train_set, train_transform)
-    # test_set = preprocessDataset(raw_test_set, test_transform)
-
-    train_set.targets = np.array(train_set.targets)
-    test_set.targets = np.array(test_set.targets)
-    # print(train_set.targets.min(), train_set.targets.max())
-
-    class_name = train_set.unique_breeds
-    unl_targets = np.random.choice(np.unique(train_set.targets), int(0.1 * len(np.unique(train_set.targets))), replace=False) # 10% of classes are unlearned
-    # unl_targets = np.random.choice(np.unique(train_set.targets), 1, replace=False) # forget only one class
-    rem_targets = np.setdiff1d(np.unique(train_set.targets), unl_targets)
-    print(f"unlearn classes: {unl_targets}, number of remain classes:{len(rem_targets)}.")
-
-    unl_idx = np.where(np.isin(train_set.targets, unl_targets))[0]
-    rem_idx = np.where(np.isin(train_set.targets, rem_targets))[0]
-    forget_set = Custom_Subset(train_set, unl_idx)
-    remain_set = Custom_Subset(train_set, rem_idx)
-    test_rem_idx = np.where(np.isin(test_set.targets, rem_targets))[0]
-    test_remain_set = Custom_Subset(test_set, test_rem_idx)
-
-    loader_args = {"num_workers": 0, "pin_memory": False}
-
-    def _init_fn(worker_id):
-        np.random.seed(int(seed))
-
-    train_loader = DataLoader(
-        train_set,
-        batch_size=batch_size,
-        shuffle=True,
-        worker_init_fn=_init_fn if seed is not None else None,
-        **loader_args,
-    )
-    val_loader = DataLoader(
-        remain_set,
-        batch_size=batch_size,
-        shuffle=False,
-        worker_init_fn=_init_fn if seed is not None else None,
-        **loader_args,
-    )
-    test_loader = DataLoader(
-        test_remain_set,
-        batch_size=batch_size,
-        shuffle=False,
-        worker_init_fn=_init_fn if seed is not None else None,
-        **loader_args,
-    )
-    forget_loader = DataLoader(
-        forget_set,
-        batch_size=batch_size,
-        shuffle=True,
-        worker_init_fn=_init_fn if seed is not None else None,
-        **loader_args,
-    )
-    retain_loader = DataLoader(
-        remain_set,
-        batch_size=batch_size,
-        shuffle=True,
-        worker_init_fn=_init_fn if seed is not None else None,
-        **loader_args,
-    )
-    print(
-        f"Traing loader: {len(train_loader.dataset)} images, Test loader: {len(test_loader.dataset)} images, Number of class: {len(class_name)}"
-    )
-    return train_loader, val_loader, test_loader, forget_loader, retain_loader, class_name
+    while hasattr(dataset, "dataset"):
+        dataset = dataset.dataset
+    dataset.transform = train_transform
+    dataset.train = False
 
 
-# ImageNet
-def imagenet_dataloaders(
-    batch_size=128,
-    data_dir="/data/datasets/Imagenet",
-    num_workers=2,
-    seed: int = 1,
-    no_aug=False,
-):
-
-    class_name = [
-        "tench", "goldfish", "great white shark", "tiger shark", "hammerhead shark", "electric ray",
-        "stingray", "rooster", "hen", "ostrich", "brambling", "goldfinch", "house finch", "junco",
-        "indigo bunting", "American robin", "bulbul", "jay", "magpie", "chickadee", "American dipper",
-        "kite (bird of prey)", "bald eagle", "vulture", "great grey owl", "fire salamander",
-        "smooth newt", "newt", "spotted salamander", "axolotl", "American bullfrog", "tree frog",
-        "tailed frog", "loggerhead sea turtle", "leatherback sea turtle", "mud turtle", "terrapin",
-        "box turtle", "banded gecko", "green iguana", "Carolina anole",
-        "desert grassland whiptail lizard", "agama", "frilled-necked lizard", "alligator lizard",
-        "Gila monster", "European green lizard", "chameleon", "Komodo dragon", "Nile crocodile",
-        "American alligator", "triceratops", "worm snake", "ring-necked snake",
-        "eastern hog-nosed snake", "smooth green snake", "kingsnake", "garter snake", "water snake",
-        "vine snake", "night snake", "boa constrictor", "African rock python", "Indian cobra",
-        "green mamba", "sea snake", "Saharan horned viper", "eastern diamondback rattlesnake",
-        "sidewinder rattlesnake", "trilobite", "harvestman", "scorpion", "yellow garden spider",
-        "barn spider", "European garden spider", "southern black widow", "tarantula", "wolf spider",
-        "tick", "centipede", "black grouse", "ptarmigan", "ruffed grouse", "prairie grouse", "peafowl",
-        "quail", "partridge", "african grey parrot", "macaw", "sulphur-crested cockatoo", "lorikeet",
-        "coucal", "bee eater", "hornbill", "hummingbird", "jacamar", "toucan", "duck",
-        "red-breasted merganser", "goose", "black swan", "tusker", "echidna", "platypus", "wallaby",
-        "koala", "wombat", "jellyfish", "sea anemone", "brain coral", "flatworm", "nematode", "conch",
-        "snail", "slug", "sea slug", "chiton", "chambered nautilus", "Dungeness crab", "rock crab",
-        "fiddler crab", "red king crab", "American lobster", "spiny lobster", "crayfish", "hermit crab",
-        "isopod", "white stork", "black stork", "spoonbill", "flamingo", "little blue heron",
-        "great egret", "bittern bird", "crane bird", "limpkin", "common gallinule", "American coot",
-        "bustard", "ruddy turnstone", "dunlin", "common redshank", "dowitcher", "oystercatcher",
-        "pelican", "king penguin", "albatross", "grey whale", "killer whale", "dugong", "sea lion",
-        "Chihuahua", "Japanese Chin", "Maltese", "Pekingese", "Shih Tzu", "King Charles Spaniel",
-        "Papillon", "toy terrier", "Rhodesian Ridgeback", "Afghan Hound", "Basset Hound", "Beagle",
-        "Bloodhound", "Bluetick Coonhound", "Black and Tan Coonhound", "Treeing Walker Coonhound",
-        "English foxhound", "Redbone Coonhound", "borzoi", "Irish Wolfhound", "Italian Greyhound",
-        "Whippet", "Ibizan Hound", "Norwegian Elkhound", "Otterhound", "Saluki", "Scottish Deerhound",
-        "Weimaraner", "Staffordshire Bull Terrier", "American Staffordshire Terrier",
-        "Bedlington Terrier", "Border Terrier", "Kerry Blue Terrier", "Irish Terrier",
-        "Norfolk Terrier", "Norwich Terrier", "Yorkshire Terrier", "Wire Fox Terrier",
-        "Lakeland Terrier", "Sealyham Terrier", "Airedale Terrier", "Cairn Terrier",
-        "Australian Terrier", "Dandie Dinmont Terrier", "Boston Terrier", "Miniature Schnauzer",
-        "Giant Schnauzer", "Standard Schnauzer", "Scottish Terrier", "Tibetan Terrier",
-        "Australian Silky Terrier", "Soft-coated Wheaten Terrier", "West Highland White Terrier",
-        "Lhasa Apso", "Flat-Coated Retriever", "Curly-coated Retriever", "Golden Retriever",
-        "Labrador Retriever", "Chesapeake Bay Retriever", "German Shorthaired Pointer", "Vizsla",
-        "English Setter", "Irish Setter", "Gordon Setter", "Brittany dog", "Clumber Spaniel",
-        "English Springer Spaniel", "Welsh Springer Spaniel", "Cocker Spaniel", "Sussex Spaniel",
-        "Irish Water Spaniel", "Kuvasz", "Schipperke", "Groenendael dog", "Malinois", "Briard",
-        "Australian Kelpie", "Komondor", "Old English Sheepdog", "Shetland Sheepdog", "collie",
-        "Border Collie", "Bouvier des Flandres dog", "Rottweiler", "German Shepherd Dog", "Dobermann",
-        "Miniature Pinscher", "Greater Swiss Mountain Dog", "Bernese Mountain Dog",
-        "Appenzeller Sennenhund", "Entlebucher Sennenhund", "Boxer", "Bullmastiff", "Tibetan Mastiff",
-        "French Bulldog", "Great Dane", "St. Bernard", "husky", "Alaskan Malamute", "Siberian Husky",
-        "Dalmatian", "Affenpinscher", "Basenji", "pug", "Leonberger", "Newfoundland dog",
-        "Great Pyrenees dog", "Samoyed", "Pomeranian", "Chow Chow", "Keeshond", "brussels griffon",
-        "Pembroke Welsh Corgi", "Cardigan Welsh Corgi", "Toy Poodle", "Miniature Poodle",
-        "Standard Poodle", "Mexican hairless dog", "grey wolf", "Alaskan tundra wolf",
-        "red wolf or maned wolf", "coyote", "dingo", "dhole", "African wild dog", "hyena", "red fox",
-        "kit fox", "Arctic fox", "grey fox", "tabby cat", "tiger cat", "Persian cat", "Siamese cat",
-        "Egyptian Mau", "cougar", "lynx", "leopard", "snow leopard", "jaguar", "lion", "tiger",
-        "cheetah", "brown bear", "American black bear", "polar bear", "sloth bear", "mongoose",
-        "meerkat", "tiger beetle", "ladybug", "ground beetle", "longhorn beetle", "leaf beetle",
-        "dung beetle", "rhinoceros beetle", "weevil", "fly", "bee", "ant", "grasshopper",
-        "cricket insect", "stick insect", "cockroach", "praying mantis", "cicada", "leafhopper",
-        "lacewing", "dragonfly", "damselfly", "red admiral butterfly", "ringlet butterfly",
-        "monarch butterfly", "small white butterfly", "sulphur butterfly", "gossamer-winged butterfly",
-        "starfish", "sea urchin", "sea cucumber", "cottontail rabbit", "hare", "Angora rabbit",
-        "hamster", "porcupine", "fox squirrel", "marmot", "beaver", "guinea pig", "common sorrel horse",
-        "zebra", "pig", "wild boar", "warthog", "hippopotamus", "ox", "water buffalo", "bison",
-        "ram (adult male sheep)", "bighorn sheep", "Alpine ibex", "hartebeest", "impala (antelope)",
-        "gazelle", "arabian camel", "llama", "weasel", "mink", "European polecat",
-        "black-footed ferret", "otter", "skunk", "badger", "armadillo", "three-toed sloth", "orangutan",
-        "gorilla", "chimpanzee", "gibbon", "siamang", "guenon", "patas monkey", "baboon", "macaque",
-        "langur", "black-and-white colobus", "proboscis monkey", "marmoset", "white-headed capuchin",
-        "howler monkey", "titi monkey", "Geoffroy's spider monkey", "common squirrel monkey",
-        "ring-tailed lemur", "indri", "Asian elephant", "African bush elephant", "red panda",
-        "giant panda", "snoek fish", "eel", "silver salmon", "rock beauty fish", "clownfish",
-        "sturgeon", "gar fish", "lionfish", "pufferfish", "abacus", "abaya", "academic gown",
-        "accordion", "acoustic guitar", "aircraft carrier", "airliner", "airship", "altar", "ambulance",
-        "amphibious vehicle", "analog clock", "apiary", "apron", "trash can", "assault rifle",
-        "backpack", "bakery", "balance beam", "balloon", "ballpoint pen", "Band-Aid", "banjo",
-        "baluster / handrail", "barbell", "barber chair", "barbershop", "barn", "barometer", "barrel",
-        "wheelbarrow", "baseball", "basketball", "bassinet", "bassoon", "swimming cap", "bath towel",
-        "bathtub", "station wagon", "lighthouse", "beaker", "military hat (bearskin or shako)",
-        "beer bottle", "beer glass", "bell tower", "baby bib", "tandem bicycle", "bikini",
-        "ring binder", "binoculars", "birdhouse", "boathouse", "bobsleigh", "bolo tie", "poke bonnet",
-        "bookcase", "bookstore", "bottle cap", "hunting bow", "bow tie", "brass memorial plaque", "bra",
-        "breakwater", "breastplate", "broom", "bucket", "buckle", "bulletproof vest",
-        "high-speed train", "butcher shop", "taxicab", "cauldron", "candle", "cannon", "canoe",
-        "can opener", "cardigan", "car mirror", "carousel", "tool kit", "cardboard box / carton",
-        "car wheel", "automated teller machine", "cassette", "cassette player", "castle", "catamaran",
-        "CD player", "cello", "mobile phone", "chain", "chain-link fence", "chain mail", "chainsaw",
-        "storage chest", "chiffonier", "bell or wind chime", "china cabinet", "Christmas stocking",
-        "church", "movie theater", "cleaver", "cliff dwelling", "cloak", "clogs", "cocktail shaker",
-        "coffee mug", "coffeemaker", "spiral or coil", "combination lock", "computer keyboard",
-        "candy store", "container ship", "convertible", "corkscrew", "cornet", "cowboy boot",
-        "cowboy hat", "cradle", "construction crane", "crash helmet", "crate", "infant bed",
-        "Crock Pot", "croquet ball", "crutch", "cuirass", "dam", "desk", "desktop computer",
-        "rotary dial telephone", "diaper", "digital clock", "digital watch", "dining table",
-        "dishcloth", "dishwasher", "disc brake", "dock", "dog sled", "dome", "doormat", "drilling rig",
-        "drum", "drumstick", "dumbbell", "Dutch oven", "electric fan", "electric guitar",
-        "electric locomotive", "entertainment center", "envelope", "espresso machine", "face powder",
-        "feather boa", "filing cabinet", "fireboat", "fire truck", "fire screen", "flagpole", "flute",
-        "folding chair", "football helmet", "forklift", "fountain", "fountain pen", "four-poster bed",
-        "freight car", "French horn", "frying pan", "fur coat", "garbage truck",
-        "gas mask or respirator", "gas pump", "goblet", "go-kart", "golf ball", "golf cart", "gondola",
-        "gong", "gown", "grand piano", "greenhouse", "radiator grille", "grocery store", "guillotine",
-        "hair clip", "hair spray", "half-track", "hammer", "hamper", "hair dryer", "hand-held computer",
-        "handkerchief", "hard disk drive", "harmonica", "harp", "combine harvester", "hatchet",
-        "holster", "home theater", "honeycomb", "hook", "hoop skirt", "gymnastic horizontal bar",
-        "horse-drawn vehicle", "hourglass", "iPod", "clothes iron", "carved pumpkin", "jeans", "jeep",
-        "T-shirt", "jigsaw puzzle", "rickshaw", "joystick", "kimono", "knee pad", "knot", "lab coat",
-        "ladle", "lampshade", "laptop computer", "lawn mower", "lens cap", "letter opener", "library",
-        "lifeboat", "lighter", "limousine", "ocean liner", "lipstick", "slip-on shoe", "lotion",
-        "music speaker", "loupe magnifying glass", "sawmill", "magnetic compass", "messenger bag",
-        "mailbox", "tights", "one-piece bathing suit", "manhole cover", "maraca", "marimba", "mask",
-        "matchstick", "maypole", "maze", "measuring cup", "medicine cabinet", "megalith", "microphone",
-        "microwave oven", "military uniform", "milk can", "minibus", "miniskirt", "minivan", "missile",
-        "mitten", "mixing bowl", "mobile home", "ford model t", "modem", "monastery", "monitor",
-        "moped", "mortar and pestle", "graduation cap", "mosque", "mosquito net", "vespa",
-        "mountain bike", "tent", "computer mouse", "mousetrap", "moving van", "muzzle", "metal nail",
-        "neck brace", "necklace", "baby pacifier", "notebook computer", "obelisk", "oboe", "ocarina",
-        "odometer", "oil filter", "pipe organ", "oscilloscope", "overskirt", "bullock cart",
-        "oxygen mask", "product packet / packaging", "paddle", "paddle wheel", "padlock", "paintbrush",
-        "pajamas", "palace", "pan flute", "paper towel", "parachute", "parallel bars", "park bench",
-        "parking meter", "railroad car", "patio", "payphone", "pedestal", "pencil case",
-        "pencil sharpener", "perfume", "Petri dish", "photocopier", "plectrum", "Pickelhaube",
-        "picket fence", "pickup truck", "pier", "piggy bank", "pill bottle", "pillow", "ping-pong ball",
-        "pinwheel", "pirate ship", "drink pitcher", "block plane", "planetarium", "plastic bag",
-        "plate rack", "farm plow", "plunger", "Polaroid camera", "pole", "police van", "poncho",
-        "pool table", "soda bottle", "plant pot", "potter's wheel", "power drill", "prayer rug",
-        "printer", "prison", "missile", "projector", "hockey puck", "punching bag", "purse", "quill",
-        "quilt", "race car", "racket", "radiator", "radio", "radio telescope", "rain barrel",
-        "recreational vehicle", "fishing casting reel", "reflex camera", "refrigerator",
-        "remote control", "restaurant", "revolver", "rifle", "rocking chair", "rotisserie", "eraser",
-        "rugby ball", "ruler measuring stick", "sneaker", "safe", "safety pin", "salt shaker", "sandal",
-        "sarong", "saxophone", "scabbard", "weighing scale", "school bus", "schooner", "scoreboard",
-        "CRT monitor", "screw", "screwdriver", "seat belt", "sewing machine", "shield", "shoe store",
-        "shoji screen / room divider", "shopping basket", "shopping cart", "shovel", "shower cap",
-        "shower curtain", "ski", "balaclava ski mask", "sleeping bag", "slide rule", "sliding door",
-        "slot machine", "snorkel", "snowmobile", "snowplow", "soap dispenser", "soccer ball", "sock",
-        "solar thermal collector", "sombrero", "soup bowl", "keyboard space bar", "space heater",
-        "space shuttle", "spatula", "motorboat", "spider web", "spindle", "sports car", "spotlight",
-        "stage", "steam locomotive", "through arch bridge", "steel drum", "stethoscope", "scarf",
-        "stone wall", "stopwatch", "stove", "strainer", "tram", "stretcher", "couch", "stupa",
-        "submarine", "suit", "sundial", "sunglasses", "sunglasses", "sunscreen", "suspension bridge",
-        "mop", "sweatshirt", "swim trunks / shorts", "swing", "electrical switch", "syringe",
-        "table lamp", "tank", "tape player", "teapot", "teddy bear", "television", "tennis ball",
-        "thatched roof", "front curtain", "thimble", "threshing machine", "throne", "tile roof",
-        "toaster", "tobacco shop", "toilet seat", "torch", "totem pole", "tow truck", "toy store",
-        "tractor", "semi-trailer truck", "tray", "trench coat", "tricycle", "trimaran", "tripod",
-        "triumphal arch", "trolleybus", "trombone", "hot tub", "turnstile", "typewriter keyboard",
-        "umbrella", "unicycle", "upright piano", "vacuum cleaner", "vase", "vaulted or arched ceiling",
-        "velvet fabric", "vending machine", "vestment", "viaduct", "violin", "volleyball",
-        "waffle iron", "wall clock", "wallet", "wardrobe", "military aircraft", "sink",
-        "washing machine", "water bottle", "water jug", "water tower", "whiskey jug", "whistle",
-        "hair wig", "window screen", "window shade", "Windsor tie", "wine bottle", "airplane wing",
-        "wok", "wooden spoon", "wool", "split-rail fence", "shipwreck", "sailboat", "yurt", "website",
-        "comic book", "crossword", "traffic or street sign", "traffic light", "dust jacket", "menu",
-        "plate", "guacamole", "consomme", "hot pot", "trifle", "ice cream", "popsicle", "baguette",
-        "bagel", "pretzel", "cheeseburger", "hot dog", "mashed potatoes", "cabbage", "broccoli",
-        "cauliflower", "zucchini", "spaghetti squash", "acorn squash", "butternut squash", "cucumber",
-        "artichoke", "bell pepper", "cardoon", "mushroom", "Granny Smith apple", "strawberry", "orange",
-        "lemon", "fig", "pineapple", "banana", "jackfruit", "cherimoya (custard apple)", "pomegranate",
-        "hay", "carbonara", "chocolate syrup", "dough", "meatloaf", "pizza", "pot pie", "burrito",
-        "red wine", "espresso", "tea cup", "eggnog", "mountain", "bubble", "cliff", "coral reef",
-        "geyser", "lakeshore", "promontory", "sandbar", "beach", "valley", "volcano", "baseball player",
-        "bridegroom", "scuba diver", "rapeseed", "daisy", "yellow lady's slipper", "corn", "acorn",
-        "rose hip", "horse chestnut seed", "coral fungus", "agaric", "gyromitra", "stinkhorn mushroom",
-        "earth star fungus", "hen of the woods mushroom", "bolete", "corn cob", "toilet paper"
-    ]
-
-    # Classes to exclude
-    exclude_classes = [
-        "Chihuahua", "Japanese Chin", "Maltese", "Pekingese", "Shih Tzu", "King Charles Spaniel",
-        "Papillon", "toy terrier", "Rhodesian Ridgeback", "Afghan Hound", "Basset Hound", "Beagle",
-        "Bloodhound", "Bluetick Coonhound", "Black and Tan Coonhound", "Treeing Walker Coonhound",
-        "English foxhound", "Redbone Coonhound", "borzoi", "Irish Wolfhound", "Italian Greyhound",
-        "Whippet", "Ibizan Hound", "Norwegian Elkhound", "Otterhound", "Saluki", "Scottish Deerhound",
-        "Weimaraner", "Staffordshire Bull Terrier", "American Staffordshire Terrier",
-        "Bedlington Terrier", "Border Terrier", "Kerry Blue Terrier", "Irish Terrier",
-        "Norfolk Terrier", "Norwich Terrier", "Yorkshire Terrier", "Wire Fox Terrier",
-        "Lakeland Terrier", "Sealyham Terrier", "Airedale Terrier", "Cairn Terrier",
-        "Australian Terrier", "Dandie Dinmont Terrier", "Boston Terrier", "Miniature Schnauzer",
-        "Giant Schnauzer", "Standard Schnauzer", "Scottish Terrier", "Tibetan Terrier",
-        "Australian Silky Terrier", "Soft-coated Wheaten Terrier", "West Highland White Terrier",
-        "Lhasa Apso", "Flat-Coated Retriever", "Curly-coated Retriever", "Golden Retriever",
-        "Labrador Retriever", "Chesapeake Bay Retriever", "German Shorthaired Pointer", "Vizsla",
-        "English Setter", "Irish Setter", "Gordon Setter", "Brittany dog", "Clumber Spaniel",
-        "English Springer Spaniel", "Welsh Springer Spaniel", "Cocker Spaniel", "Sussex Spaniel",
-        "Irish Water Spaniel", "Kuvasz", "Schipperke", "Groenendael dog", "Malinois", "Briard",
-        "Australian Kelpie", "Komondor", "Old English Sheepdog", "Shetland Sheepdog", "collie",
-        "Border Collie", "Bouvier des Flandres dog", "Rottweiler", "German Shepherd Dog", "Dobermann",
-        "Miniature Pinscher", "Greater Swiss Mountain Dog", "Bernese Mountain Dog",
-        "Appenzeller Sennenhund", "Entlebucher Sennenhund", "Boxer", "Bullmastiff", "Tibetan Mastiff",
-        "French Bulldog", "Great Dane", "St. Bernard", "husky", "Alaskan Malamute", "Siberian Husky",
-        "Dalmatian", "Affenpinscher", "Basenji", "pug", "Leonberger", "Newfoundland dog",
-        "Great Pyrenees dog", "Samoyed", "Pomeranian", "Chow Chow", "Keeshond", "brussels griffon",
-        "Pembroke Welsh Corgi", "Cardigan Welsh Corgi", "Toy Poodle", "Miniature Poodle",
-        "Standard Poodle", "Mexican hairless dog",
-        "tabby cat", "tiger cat", "Persian cat", "Siamese cat", "Egyptian Mau", "cougar", "lynx",
-    ]
-    # create # {class_id: class_name} mapping
-    class_map = {i: class_name[i] for i in range(len(class_name))}
-
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    if no_aug:
-        train_transform = transforms.Compose(
+def dataset_convert_to_test(dataset, args=None):
+    if args.dataset == "TinyImagenet":
+        test_transform = transforms.Compose([])
+    elif args.dataset == "celeba":
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        test_transform = transforms.Compose(
             [
                 transforms.Resize((256, 256)),
                 transforms.CenterCrop(224),
@@ -392,233 +121,446 @@ def imagenet_dataloaders(
             ]
         )
     else:
-        train_transform = transforms.Compose(
+        test_transform = transforms.Compose(
             [
-                transforms.Resize((256, 256)),
-                transforms.CenterCrop(224),
-                transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                normalize,
             ]
         )
+    while hasattr(dataset, "dataset"):
+        dataset = dataset.dataset
+    dataset.transform = test_transform
+    dataset.train = False
 
-    test_transform = transforms.Compose(
-        [
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
-    print(
-        "Dataset information: ImageNet"
-    )
 
-    train_set = ImageFolder(root=data_dir + '/train', transform=train_transform)
-    test_set = ImageFolder(root=data_dir + '/val', transform=test_transform)
-
-    # # Create a filtered dataset excluding the specified classes
-    # filtered_indices = []
-    # for idx, (image, label) in enumerate(test_set):
-    #     class_name = class_map[label]
-    #     if class_name not in exclude_classes:
-    #         filtered_indices.append(idx)
-    # # Create a new dataset with only the allowed indices
-    # class FilteredImageFolder(ImageFolder):
-    #     def __getitem__(self, index):
-    #         # Get the original index
-    #         original_index = filtered_indices[index]
-    #         # Call the parent class's method with the original index
-    #         return super().__getitem__(original_index)
-    # # Create the filtered dataset
-    # filtered_test_set = FilteredImageFolder(root=data_dir + '/val', transform=test_transform)
-
-    loader_args = {"num_workers": 0, "pin_memory": False}
-    def _init_fn(worker_id):
-        np.random.seed(int(seed))
-
-    train_loader = DataLoader(
-        train_set,
-        batch_size=batch_size,
-        shuffle=True,
-        worker_init_fn=_init_fn if seed is not None else None,
-        **loader_args,
-    )
-    test_loader = DataLoader(
-        test_set,
-        batch_size=batch_size,
-        shuffle=False,
-        worker_init_fn=_init_fn if seed is not None else None,
-        **loader_args,
-    )
-    print(
-        f"Traing loader: {len(train_set.samples)} images, Test loader: {len(test_set.samples)} images"
-    )
-    return train_loader, test_loader, class_name, exclude_classes, class_map
-
-# Standford cars
-def standfordCars_dataloaders(
-    batch_size=128,
-    data_dir="/data/datasets/stanfordCars",
-    num_workers=2,
-    seed: int = 1,
-    no_aug=False,
-):
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    if no_aug:
-        train_transform = transforms.Compose(
-            [
-                transforms.Resize((256, 256)),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                normalize,
-            ]
+def setup_model_dataset(args):
+    if args.dataset == "cifar10":
+        classes = 10
+        normalization = NormalizeByChannelMeanStd(
+            mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616]
         )
+        train_full_loader, val_loader, _ = cifar10_dataloaders(
+            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
+        )
+        marked_loader, _, test_loader = cifar10_dataloaders(
+            batch_size=args.batch_size,
+            data_dir=args.data,
+            num_workers=args.workers,
+            class_to_replace=args.class_to_replace,
+            num_indexes_to_replace=args.num_indexes_to_replace,
+            indexes_to_replace=args.indexes_to_replace,
+            seed=args.seed,
+            only_mark=True,
+            shuffle=True,
+            no_aug=args.no_aug,
+        )
+
+        if args.train_seed is None:
+            args.train_seed = args.seed
+        setup_seed(args.train_seed)
+
+        if args.imagenet_arch:
+            model = model_dict[args.arch](num_classes=classes, imagenet=True)
+        else:
+            model = model_dict[args.arch](num_classes=classes)
+
+        setup_seed(args.train_seed)
+
+        model.normalize = normalization
+        print(model)
+        return model, train_full_loader, val_loader, test_loader, marked_loader
+    elif args.dataset == "svhn":
+        classes = 10
+        normalization = NormalizeByChannelMeanStd(
+            mean=[0.4377, 0.4438, 0.4728], std=[0.1201, 0.1231, 0.1052]
+        )
+        train_full_loader, val_loader, _ = svhn_dataloaders(
+            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
+        )
+        marked_loader, _, test_loader = svhn_dataloaders(
+            batch_size=args.batch_size,
+            data_dir=args.data,
+            num_workers=args.workers,
+            class_to_replace=args.class_to_replace,
+            num_indexes_to_replace=args.num_indexes_to_replace,
+            indexes_to_replace=args.indexes_to_replace,
+            seed=args.seed,
+            only_mark=True,
+            shuffle=True,
+        )
+        if args.imagenet_arch:
+            model = model_dict[args.arch](num_classes=classes, imagenet=True)
+        else:
+            model = model_dict[args.arch](num_classes=classes)
+
+        model.normalize = normalization
+        print(model)
+        return model, train_full_loader, val_loader, test_loader, marked_loader
+    elif args.dataset == "cifar100":
+        classes = 100
+        normalization = NormalizeByChannelMeanStd(
+            mean=[0.5071, 0.4866, 0.4409], std=[0.2673, 0.2564, 0.2762]
+        )
+        train_full_loader, val_loader, _ = cifar100_dataloaders(
+            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
+        )
+        marked_loader, _, test_loader = cifar100_dataloaders(
+            batch_size=args.batch_size,
+            data_dir=args.data,
+            num_workers=args.workers,
+            class_to_replace=args.class_to_replace,
+            num_indexes_to_replace=args.num_indexes_to_replace,
+            indexes_to_replace=args.indexes_to_replace,
+            seed=args.seed,
+            only_mark=True,
+            shuffle=True,
+            no_aug=args.no_aug,
+        )
+        if args.imagenet_arch:
+            model = model_dict[args.arch](num_classes=classes, imagenet=True)
+        else:
+            model = model_dict[args.arch](num_classes=classes)
+        model.normalize = normalization
+        print(model)
+        return model, train_full_loader, val_loader, test_loader, marked_loader
+    elif args.dataset == "TinyImagenet":
+        classes = 200
+        normalization = NormalizeByChannelMeanStd(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+        train_full_loader, val_loader, test_loader = TinyImageNet(args).data_loaders(
+            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
+        )
+        # train_full_loader, val_loader, test_loader =None, None,None
+        marked_loader, _, _ = TinyImageNet(args).data_loaders(
+            batch_size=args.batch_size,
+            data_dir=args.data,
+            num_workers=args.workers,
+            class_to_replace=args.class_to_replace,
+            num_indexes_to_replace=args.num_indexes_to_replace,
+            indexes_to_replace=args.indexes_to_replace,
+            seed=args.seed,
+            only_mark=True,
+            shuffle=True,
+        )
+        if args.imagenet_arch:
+            model = model_dict[args.arch](num_classes=classes, imagenet=True)
+        else:
+            model = model_dict[args.arch](num_classes=classes)
+
+        model.normalize = normalization
+        print(model)
+        return model, train_full_loader, val_loader, test_loader, marked_loader
+
+    elif args.dataset == "imagenet":
+        classes = 1000
+        normalization = NormalizeByChannelMeanStd(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+        train_ys = torch.load(args.train_y_file)
+        val_ys = torch.load(args.val_y_file)
+        model = model_dict[args.arch](num_classes=classes, imagenet=True)
+
+        model.normalize = normalization
+        print(model)
+        if args.class_to_replace is None:
+            loaders = prepare_data(dataset="imagenet", batch_size=args.batch_size)
+            train_loader, val_loader = loaders["train"], loaders["val"]
+            return model, train_loader, val_loader
+        else:
+            train_subset_indices = torch.ones_like(train_ys)
+            val_subset_indices = torch.ones_like(val_ys)
+            train_subset_indices[train_ys == args.class_to_replace] = 0
+            val_subset_indices[val_ys == args.class_to_replace] = 0
+            loaders = prepare_data(
+                dataset="imagenet",
+                batch_size=args.batch_size,
+                train_subset_indices=train_subset_indices,
+                val_subset_indices=val_subset_indices,
+            )
+            retain_loader = loaders["train"]
+            forget_loader = loaders["fog"]
+            val_loader = loaders["val"]
+            return model, retain_loader, forget_loader, val_loader
+
+    elif args.dataset == "imagenet100":
+        # ImageNet-100: direct HuggingFace dataset ``clane9/imagenet-100``.
+        # Returns the same 6-tuple shape as the celeba branch:
+        #     (model, train_full, val, test, forget, retain)
+        # which main_forget.py / main_random.py treat as "loaders are
+        # already split, no marked_loader needed".
+        classes = 100
+        normalization = NormalizeByChannelMeanStd(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+
+        # Build the train / val loaders (with optional class-to-replace
+        # forget/retain split inside ``prepare_data``).
+        if args.class_to_replace is not None and args.class_to_replace >= 0:
+            # Convert the 0..99 contiguous label space to subset indices for
+            # ``prepare_data``: we mark a single class as the forget set.
+            # Because ``prepare_data`` for imagenet100 already remaps to
+            # contiguous labels via the closure, we just pre-build masks on
+            # the contiguous label space by streaming once.
+            tmp = prepare_data(
+                dataset="imagenet100",
+                batch_size=args.batch_size,
+                shuffle=False,
+                data_path=getattr(args, "data", "/localscratch/dataset"),
+            )
+            # Walk train/val labels once to build subset indicators.
+            train_ys = []
+            for batch in tmp["train"]:
+                y = batch["label"] if isinstance(batch, dict) else batch[1]
+                train_ys.append(torch.as_tensor(y).view(-1))
+            train_ys = torch.cat(train_ys)
+            val_ys = []
+            for batch in tmp["val"]:
+                y = batch["label"] if isinstance(batch, dict) else batch[1]
+                val_ys.append(torch.as_tensor(y).view(-1))
+            val_ys = torch.cat(val_ys)
+
+            train_subset_indices = torch.ones_like(train_ys)
+            val_subset_indices = torch.ones_like(val_ys)
+            train_subset_indices[train_ys == args.class_to_replace] = 0
+            val_subset_indices[val_ys == args.class_to_replace] = 0
+
+            loaders = prepare_data(
+                dataset="imagenet100",
+                batch_size=args.batch_size,
+                train_subset_indices=train_subset_indices,
+                val_subset_indices=val_subset_indices,
+                data_path=getattr(args, "data", "/localscratch/dataset"),
+            )
+            retain_loader = loaders["train"]
+            forget_loader = loaders["fog"]
+            val_loader = loaders["val"]
+            # ``test_loader`` is the same as ``val_loader`` for ImageNet (no
+            # held-out test split is publicly labelled). Reuse val for both.
+            test_loader = val_loader
+            train_full_loader = val_loader  # only used for size assertions
+        else:
+            loaders = prepare_data(
+                dataset="imagenet100",
+                batch_size=args.batch_size,
+                data_path=getattr(args, "data", "/localscratch/dataset"),
+            )
+            train_full_loader = loaders["train"]
+            val_loader = loaders["val"]
+            test_loader = val_loader
+            forget_loader = None
+            retain_loader = train_full_loader
+
+        if args.imagenet_arch:
+            model = model_dict[args.arch](num_classes=classes, imagenet=True)
+        else:
+            model = model_dict[args.arch](num_classes=classes, imagenet=True)
+        model.normalize = normalization
+        return (
+            model,
+            train_full_loader,
+            val_loader,
+            test_loader,
+            forget_loader,
+            retain_loader,
+        )
+
+    elif args.dataset == "cifar100_no_val":
+        classes = 100
+        normalization = NormalizeByChannelMeanStd(
+            mean=[0.5071, 0.4866, 0.4409], std=[0.2673, 0.2564, 0.2762]
+        )
+        train_set_loader, val_loader, test_loader = cifar100_dataloaders_no_val(
+            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
+        )
+
+    elif args.dataset == "cifar10_no_val":
+        classes = 10
+        normalization = NormalizeByChannelMeanStd(
+            mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616]
+        )
+        train_set_loader, val_loader, test_loader = cifar10_dataloaders_no_val(
+            batch_size=args.batch_size, data_dir=args.data, num_workers=args.workers
+        )
+
+    elif args.dataset == "celeba": # CelebA Mask HQ
+        classes = 307
+        normalization = NormalizeByChannelMeanStd(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+        train_full_loader, val_loader, test_loader, forget_loader, retain_loader = celeba_dataloaders(
+            batch_size=args.batch_size,
+            data_dir=args.data,
+            num_workers=args.workers,
+            class_to_replace=args.class_to_replace,
+            num_indexes_to_replace=args.num_indexes_to_replace,
+            indexes_to_replace=args.indexes_to_replace,
+            seed=args.seed,
+            only_mark=True,
+            shuffle=True,
+        )
+
+        # dataloaders = [train_full_loader, val_loader, test_loader, forget_loader, retain_loader]
+        # for i in range(len(dataloaders)):
+        #     if dataloaders[i] is not None:
+        #         image, label = next(iter(dataloaders[i]))
+        #         print(i, image.size(), label)
+
+        if args.train_seed is None:
+            args.train_seed = args.seed
+        setup_seed(args.train_seed)
+
+        model = resnet34(pretrained=True)
+        num_features = model.fc.in_features
+        model.fc = torch.nn.Linear(num_features, classes)
+
+        setup_seed(args.train_seed)
+
+        model.normalize = normalization
+        # print(model)
+        return model, train_full_loader, val_loader, test_loader, forget_loader, retain_loader
     else:
-        train_transform = transforms.Compose(
-            [
-                transforms.Resize((256, 256)),
-                transforms.CenterCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]
-        )
+        raise ValueError("Dataset not supprot yet !")
+    # import pdb;pdb.set_trace()
 
-    test_transform = transforms.Compose(
-        [
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
-    print(
-        "Dataset information: Stanford cars"
-    )
-
-    train_set = datasets.StanfordCars(data_dir, split='train', transform=train_transform, download=False) # need to set pil_image = Image.open(image_path).convert("RGB") in datasets.StanfordCars
-    test_set = datasets.StanfordCars(data_dir, split='test', transform=test_transform, download=False)
-
-    class_name = train_set.classes
-
-    loader_args = {"num_workers": 0, "pin_memory": False}
-
-    def _init_fn(worker_id):
-        np.random.seed(int(seed))
-
-    train_loader = DataLoader(
-        train_set,
-        batch_size=batch_size,
-        shuffle=True,
-        worker_init_fn=_init_fn if seed is not None else None,
-        **loader_args,
-    )
-
-    test_loader = DataLoader(
-        test_set,
-        batch_size=batch_size,
-        shuffle=False,
-        worker_init_fn=_init_fn if seed is not None else None,
-        **loader_args,
-    )
-
-    print(
-        f"Traing loader: {len(train_set)} images, Test loader: {len(test_set)} images, Number of class: {len(class_name)}"
-    )
-    return train_loader, test_loader, class_name
-
-
-
-# Caltech101
-def caltech101_dataloaders(
-    batch_size=128,
-    data_dir="/data/datasets",
-    num_workers=2,
-    seed: int = 1,
-    no_aug=False,
-):
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    if no_aug:
-        train_transform = transforms.Compose(
-            [
-                transforms.Resize((256, 256)),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                normalize,
-            ]
-        )
+    if args.imagenet_arch:
+        model = model_dict[args.arch](num_classes=classes, imagenet=True)
     else:
-        train_transform = transforms.Compose(
-            [
-                transforms.Resize((256, 256)),
-                transforms.CenterCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]
-        )
+        model = model_dict[args.arch](num_classes=classes)
 
-    test_transform = transforms.Compose(
-        [
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ]
+    model.normalize = normalization
+    print(model)
+
+    return model, train_set_loader, val_loader, test_loader
+
+
+def setup_seed(seed):
+    print("setup random seed = {}".format(seed))
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+class NormalizeByChannelMeanStd(torch.nn.Module):
+    def __init__(self, mean, std):
+        super(NormalizeByChannelMeanStd, self).__init__()
+        if not isinstance(mean, torch.Tensor):
+            mean = torch.tensor(mean)
+        if not isinstance(std, torch.Tensor):
+            std = torch.tensor(std)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
+
+    def forward(self, tensor):
+        return self.normalize_fn(tensor, self.mean, self.std)
+
+    def extra_repr(self):
+        return "mean={}, std={}".format(self.mean, self.std)
+
+    def normalize_fn(self, tensor, mean, std):
+        """Differentiable version of torchvision.functional.normalize"""
+        # here we assume the color channel is in at dim=1
+        mean = mean[None, :, None, None]
+        std = std[None, :, None, None]
+        return tensor.sub(mean).div(std)
+
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+
+def run_commands(gpus, commands, call=False, dir="commands", shuffle=True, delay=0.5):
+    if len(commands) == 0:
+        return
+    if os.path.exists(dir):
+        shutil.rmtree(dir)
+    if shuffle:
+        random.shuffle(commands)
+        random.shuffle(gpus)
+    os.makedirs(dir, exist_ok=True)
+
+    fout = open("stop_{}.sh".format(dir), "w")
+    print("kill $(ps aux|grep 'bash " + dir + "'|awk '{print $2}')", file=fout)
+    fout.close()
+
+    n_gpu = len(gpus)
+    for i, gpu in enumerate(gpus):
+        i_commands = commands[i::n_gpu]
+        if len(i_commands) == 0:
+            continue
+        prefix = "CUDA_VISIBLE_DEVICES={} ".format(gpu)
+
+        sh_path = os.path.join(dir, "run{}.sh".format(i))
+        fout = open(sh_path, "w")
+        for com in i_commands:
+            print(prefix + com, file=fout)
+        fout.close()
+        if call:
+            os.system("bash {}&".format(sh_path))
+            time.sleep(delay)
+
+
+def get_loader_from_dataset(dataset, batch_size, seed=1, shuffle=True):
+    return torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, num_workers=0, pin_memory=True, shuffle=shuffle
     )
-    print(
-        "Dataset information: Caltech101"
+
+
+def get_unlearn_loader(marked_loader, args):
+    forget_dataset = copy.deepcopy(marked_loader.dataset)
+    marked = forget_dataset.targets < 0
+    forget_dataset.data = forget_dataset.data[marked]
+    forget_dataset.targets = -forget_dataset.targets[marked] - 1
+    forget_loader = get_loader_from_dataset(
+        forget_dataset, batch_size=args.batch_size, seed=args.seed, shuffle=True
+    )
+    retain_dataset = copy.deepcopy(marked_loader.dataset)
+    marked = retain_dataset.targets >= 0
+    retain_dataset.data = retain_dataset.data[marked]
+    retain_dataset.targets = retain_dataset.targets[marked]
+    retain_loader = get_loader_from_dataset(
+        retain_dataset, batch_size=args.batch_size, seed=args.seed, shuffle=True
+    )
+    print("datasets length: ", len(forget_dataset), len(retain_dataset))
+    return forget_loader, retain_loader
+
+
+def get_poisoned_loader(poison_loader, unpoison_loader, test_loader, poison_func, args):
+    poison_dataset = copy.deepcopy(poison_loader.dataset)
+    poison_test_dataset = copy.deepcopy(test_loader.dataset)
+
+    poison_dataset.data, poison_dataset.targets = poison_func(
+        poison_dataset.data, poison_dataset.targets
+    )
+    poison_test_dataset.data, poison_test_dataset.targets = poison_func(
+        poison_test_dataset.data, poison_test_dataset.targets
     )
 
-    data_set = datasets.Caltech101(data_dir, target_type="category", transform=train_transform, download=False)
-    # use random_split to split the dataset into train and test: 0.5 for each
-    train_set, test_set = random_split(data_set, [int(0.5 * len(data_set)), len(data_set) - int(0.5 * len(data_set))])
-
-    class_name = os.listdir(data_dir + '/caltech101/101_ObjectCategories')
-    class_name.remove('BACKGROUND_Google')
-
-    loader_args = {"num_workers": 0, "pin_memory": False}
-
-    def _init_fn(worker_id):
-        np.random.seed(int(seed))
-
-    train_loader = DataLoader(
-        train_set,
-        batch_size=batch_size,
-        shuffle=True,
-        worker_init_fn=_init_fn if seed is not None else None,
-        **loader_args,
+    full_dataset = torch.utils.data.ConcatDataset(
+        [unpoison_loader.dataset, poison_dataset]
     )
 
-    test_loader = DataLoader(
-        test_set,
-        batch_size=batch_size,
-        shuffle=False,
-        worker_init_fn=_init_fn if seed is not None else None,
-        **loader_args,
+    poisoned_loader = get_loader_from_dataset(
+        poison_dataset, batch_size=args.batch_size, seed=args.seed, shuffle=False
+    )
+    poisoned_full_loader = get_loader_from_dataset(
+        full_dataset, batch_size=args.batch_size, seed=args.seed, shuffle=True
+    )
+    poisoned_test_loader = get_loader_from_dataset(
+        poison_test_dataset, batch_size=args.batch_size, seed=args.seed, shuffle=False
     )
 
-    print(
-        f"Traing loader: {len(train_set)} images, Test loader: {len(test_set)} images, Number of class: {len(class_name)}"
-    )
-    return train_loader, test_loader, class_name
-
-
-
-
-
-# if __name__ == "__main__":
-
-#     train_full_loader, val_loader, test_loader, forget_loader, retain_loader, class_name = oxfordPets_dataloaders(
-#         batch_size=8,
-#         data_dir='/data/datasets/oxford_pets',
-#         num_workers=2,
-#         seed=1,
-#     )
-
-#     print(train_full_loader.dataset.breed_to_idx)
-
-
-# # python -m loadData.dataset
-# {'Abyssinian': 0, 'Bengal': 1, 'Birman': 2, 'Bombay': 3, 'British_Shorthair': 4, 'Egyptian_Mau': 5, 'Maine_Coon': 6, 'Persian': 7, 'Ragdoll': 8, 'Russian_Blue': 9, 'Siamese': 10, 'Sphynx': 11, 'american_bulldog': 12, 'american_pit_bull_terrier': 13, 'basset_hound': 14, 'beagle': 15, 'boxer': 16, 'chihuahua': 17, 'english_cocker_spaniel': 18, 'english_setter': 19, 'german_shorthaired': 20, 'great_pyrenees': 21, 'havanese': 22, 'japanese_chin': 23, 'keeshond': 24, 'leonberger': 25, 'miniature_pinscher': 26, 'newfoundland': 27, 'pomeranian': 28, 'pug': 29, 'saint_bernard': 30, 'samoyed': 31, 'scottish_terrier': 32, 'shiba_inu': 33, 'staffordshire_bull_terrier': 34, 'wheaten_terrier': 35, 'yorkshire_terrier': 36}
+    return poisoned_loader, unpoison_loader, poisoned_full_loader, poisoned_test_loader
