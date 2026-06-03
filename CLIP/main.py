@@ -10,7 +10,7 @@ import torch.utils.data
 import utils
 
 import clip
-from unlearn import MUNBa, FT, GA, SalUn, IMU
+from unlearn import MUNBa, FT, GA, SalUn, IMU, IU
 
 
 def main():
@@ -88,6 +88,8 @@ def main():
         MUNBa.munba(texts, unlearn_data_loaders, model, args, class_name)
     elif args.unlearn == "IMU":
         IMU.IMU(texts, unlearn_data_loaders, model, args, class_name)
+    elif args.unlearn == "IU":
+        IU.IU(texts, unlearn_data_loaders, model, args, class_name)
     else:
         raise ValueError(f"unlearn method {args.unlearn} not implemented")
 
