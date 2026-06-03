@@ -76,7 +76,7 @@ class AverageMeter(object):
 
 
 def dataset_convert_to_train(dataset, args=None):
-    if args.dataset == "pets":
+    if args.dataset == "pets" or args.dataset == "imagenet100":
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         train_transform = transforms.Compose(
             [
@@ -97,7 +97,7 @@ def dataset_convert_to_train(dataset, args=None):
 
 
 def dataset_convert_to_test(dataset, args=None):
-    if args.dataset == "pets" or args.dataset == "stanfordCars" or args.dataset == "imagenet":
+    if args.dataset == "pets" or args.dataset == "stanfordCars" or args.dataset == "imagenet" or args.dataset == "imagenet100":
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         test_transform = transforms.Compose(
             [
@@ -123,6 +123,18 @@ def setup_dataset(args):
             data_dir=args.data,
             num_workers=args.workers,
             seed=args.seed,
+        )
+        setup_seed(args.seed)
+    elif args.dataset == "imagenet100":
+        forget_classes = getattr(args, "forget_classes", None)
+        forget_class_ratio = getattr(args, "forget_class_ratio", 0.1)
+        train_full_loader, val_loader, test_loader, forget_loader, retain_loader, class_name = imagenet100_dataloaders(
+            batch_size=args.batch_size,
+            data_dir=args.data,
+            num_workers=args.workers,
+            seed=args.seed,
+            forget_class_ratio=forget_class_ratio,
+            forget_classes=forget_classes,
         )
         setup_seed(args.seed)
     else:
