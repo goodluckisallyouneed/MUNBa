@@ -10,7 +10,7 @@ import torch.utils.data
 import utils
 
 import clip
-from unlearn import MUNBa, FT, GA, SalUn, SHs
+from unlearn import MUNBa, FT, GA, SalUn, SHs, IMU
 
 
 def main():
@@ -51,7 +51,10 @@ def main():
     # print(model)
 
     # prompts = [f"an image of a {label}" for label in class_name]
-    prompts = [f"A photo of a {label}, a type of pet" for label in class_name]
+    if args.dataset == "pets":
+        prompts = [f"A photo of a {label}, a type of pet" for label in class_name]
+    else:
+        prompts = [f"a photo of a {label}." for label in class_name]
     print(prompts, len(class_name))
     texts = clip.tokenize(prompts).to(device)
     logit_scale = 100
@@ -83,6 +86,8 @@ def main():
         SHs.Scissorhands(texts, unlearn_data_loaders, model, args, class_name)
     elif args.unlearn == "MUNBa":
         MUNBa.munba(texts, unlearn_data_loaders, model, args, class_name)
+    elif args.unlearn == "IMU":
+        IMU.IMU(texts, unlearn_data_loaders, model, args, class_name)
     else:
         raise ValueError(f"unlearn method {args.unlearn} not implemented")
 
