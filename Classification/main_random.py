@@ -31,7 +31,7 @@ def main():
     seed = args.seed
 
     # prepare dataset
-    if args.dataset != 'celeba':
+    if args.dataset not in ('celeba', 'imagenet100'):
         (
             model,
             train_loader_full,
